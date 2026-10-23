@@ -19,6 +19,8 @@ RTL8761BU adapter, Omarchy, PipeWire 1.6.9, WirePlumber, Qt 6.12.
 | Taking them off mid-call no longer ends the call | patched here, see `patches/` |
 | **AirPods microphone at 64 kHz while A2DP keeps playing** | works, in the daemon, with the UI running |
 | Microphone arms itself when an app records, disarms when it stops | works |
+| Switch and state line in the bar popup | works |
+| `testbed/callcheck.py`, a pre-meeting check | works |
 
 ## The constraint that explains everything
 
@@ -61,6 +63,17 @@ It does not install the bar widget itself. That is the upstream plugin:
 ```bash
 omarchy plugin add https://github.com/hjanuschka/omarchy-pods --enable
 ```
+
+## Before a meeting
+
+```bash
+python3 testbed/callcheck.py     # needs pyside6
+```
+
+It says Ready or Not ready, names the input, output, card profile and whether
+the microphone is streaming, shows a live level meter, and records four seconds
+and plays them back so you hear what the far side will hear. It changes nothing
+unless you press "Use the AirPods mic".
 
 ## Audio defaults, and why they matter
 
