@@ -1,0 +1,83 @@
+From 7a3f04e395cbc62558638a23f44a1758cb6302ac Mon Sep 17 00:00:00 2001
+From: Helmut Januschka <helmut@januschka.com>
+Date: Fri, 23 Oct 2026 16:28:53 +0200
+Subject: [PATCH 1/6] fix: keep the card while the mic is live
+
+Ear detection released the bluez card on a both-out report even when a
+capture was live, which dropped the headset profiles the call's mic was
+on and ended the call. The A2DP activation path already defers under a
+live capture; the release path had no such guard.
+
+mayReleaseCard() sits next to unansweredChecksAfter() so the decision is
+testable without a sound server. A later both-out report releases the
+card once the call ends, so no timer is added.
+---
+ daemon/media/capturematch.hpp     | 7 +++++++
+ daemon/media/mediacontroller.cpp  | 8 ++++++++
+ daemon/tests/tst_capturematch.cpp | 9 +++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/daemon/media/capturematch.hpp b/daemon/media/capturematch.hpp
+index bb4559e..cdd1a9a 100644
+--- a/daemon/media/capturematch.hpp
++++ b/daemon/media/capturematch.hpp
+@@ -21,3 +21,10 @@ inline int unansweredChecksAfter(CaptureState state, int unanswered)
+ {
+     return state == CaptureState::Unknown ? unanswered + 1 : 0;
+ }
++
++// Releasing the card under a live capture drops the headset profiles the call's mic is on, and
++// Unknown is not evidence the mic is free.
++inline bool mayReleaseCard(CaptureState state)
++{
++    return state == CaptureState::Idle;
++}
+diff --git a/daemon/media/mediacontroller.cpp b/daemon/media/mediacontroller.cpp
+index 481d64e..ed5ca34 100644
+--- a/daemon/media/mediacontroller.cpp
++++ b/daemon/media/mediacontroller.cpp
+@@ -371,6 +371,14 @@ void MediaController::removeAudioOutputDevice() {
+     return;
+   }
+ 
++  // A later both-out report releases the card once the call ends, so this needs no timer of its own.
++  const CaptureState capture = m_pulseAudio->captureState(connectedDeviceMacAddress);
++  if (!mayReleaseCard(capture)) {
++    LOG_INFO("Capture " << (capture == CaptureState::Live ? "live" : "unknown")
++             << " on the AirPods, keeping the card so the call holds its headset profile");
++    return;
++  }
++
+   // Ear detection fires on every packet, so without this the card is re-released every few seconds.
+   if (m_pulseAudio->getActiveCardProfile(m_deviceOutputName) == QStringLiteral("off")) {
+     return;
+diff --git a/daemon/tests/tst_capturematch.cpp b/daemon/tests/tst_capturematch.cpp
+index 890db38..4d08d47 100644
+--- a/daemon/tests/tst_capturematch.cpp
++++ b/daemon/tests/tst_capturematch.cpp
+@@ -15,6 +15,7 @@ private slots:
+     void matchesTheMonitorNameToo();
+     void anAnsweredQueryClearsTheUnansweredCount();
+     void onlyAnUnknownQuerySpendsTheUnansweredCount();
++    void onlyAnIdleCaptureReleasesTheCard();
+ };
+ 
+ void TestCaptureMatch::matchesTheWirePlumberLoopbackName()
+@@ -47,6 +48,14 @@ void TestCaptureMatch::matchesTheMonitorNameToo()
+     QVERIFY(sourceNamesAddress("bluez_output.AA_BB_CC_DD_EE_FF.1.monitor", "AA_BB_CC_DD_EE_FF"));
+ }
+ 
++void TestCaptureMatch::onlyAnIdleCaptureReleasesTheCard()
++{
++    // A release while the mic is live takes the headset profiles with it, which ends the call.
++    QVERIFY(!mayReleaseCard(CaptureState::Live));
++    QVERIFY(!mayReleaseCard(CaptureState::Unknown));
++    QVERIFY(mayReleaseCard(CaptureState::Idle));
++}
++
+ void TestCaptureMatch::anAnsweredQueryClearsTheUnansweredCount()
+ {
+     // Live and Idle are both answers, so neither may walk a long call towards the give-up path.
+-- 
+2.56.0
+

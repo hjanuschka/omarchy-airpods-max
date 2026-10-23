@@ -1,0 +1,396 @@
+From f0f113de13698d926a3a561ec89855f35de976ea Mon Sep 17 00:00:00 2001
+From: Helmut Januschka <helmut@januschka.com>
+Date: Fri, 23 Oct 2026 17:43:39 +0200
+Subject: [PATCH 5/6] hires mic: decode the uplink and publish a PipeWire
+ source
+
+Decodes each AAC-ELD access unit through the system libavcodec and
+writes s16 into a FIFO that module-pipe-source publishes as
+AirPodsHiRes at 64 kHz mono. The decoder needs the uplink's 48 kHz
+coding rate and its four-byte AudioSpecificConfig; the stream itself
+decodes to 64 kHz.
+
+Measured on AirPods Max 2 with this daemon holding the control link:
+400 access units, 400 frames decoded, no errors, and a 9.9 s capture
+from the published source at 64 kHz mono carrying speech. The card
+stayed where ear detection had left it throughout, since the uplink
+rides AACP rather than an audio profile.
+
+The fifo is opened read-write so the writer never blocks on a missing
+reader, and a full pipe drops the frame rather than stalling the
+control link.
+
+Not ported from the reference implementation: its automatic gain
+control. Captures here measure quieter than the Rust daemon's, which is
+that difference and not a decode fault.
+---
+ daemon/CMakeLists.txt     |   9 +-
+ daemon/main.cpp           |  17 +++-
+ daemon/media/eldpcm.hpp   |  22 +++++
+ daemon/media/hiresmic.cpp | 180 ++++++++++++++++++++++++++++++++++++++
+ daemon/media/hiresmic.h   |  46 ++++++++++
+ 5 files changed, 270 insertions(+), 4 deletions(-)
+ create mode 100644 daemon/media/eldpcm.hpp
+ create mode 100644 daemon/media/hiresmic.cpp
+ create mode 100644 daemon/media/hiresmic.h
+
+diff --git a/daemon/CMakeLists.txt b/daemon/CMakeLists.txt
+index c3579e8..a5bd026 100644
+--- a/daemon/CMakeLists.txt
++++ b/daemon/CMakeLists.txt
+@@ -8,6 +8,8 @@ find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 Widgets Bluetooth DBus
+ find_package(OpenSSL REQUIRED)
+ find_package(PkgConfig REQUIRED)
+ pkg_check_modules(PULSEAUDIO REQUIRED libpulse)
++# AAC-ELD decode for the hi-res microphone uplink. System libavcodec, no bundled build.
++pkg_check_modules(AVCODEC REQUIRED libavcodec libavutil)
+ 
+ qt_standard_project_setup()
+ 
+@@ -23,6 +25,10 @@ qt_add_executable(librepods
+     media/mediacontroller.h
+     media/pulseaudiocontroller.cpp
+     media/pulseaudiocontroller.h
++    media/hiresmic.cpp
++    media/hiresmic.h
++    media/hiresframe.hpp
++    media/eldpcm.hpp
+     airpods_packets.h
+     trayiconmanager.cpp
+     trayiconmanager.h
+@@ -79,8 +85,9 @@ qt_add_resources(librepods "resources"
+         assets/podmax.png
+ )
+ 
++target_include_directories(librepods PRIVATE ${AVCODEC_INCLUDE_DIRS})
+ target_link_libraries(librepods
+-    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Widgets Qt6::Bluetooth Qt6::DBus OpenSSL::SSL OpenSSL::Crypto ${PULSEAUDIO_LIBRARIES}
++    PRIVATE Qt6::Quick Qt6::QuickControls2 Qt6::Widgets Qt6::Bluetooth Qt6::DBus OpenSSL::SSL OpenSSL::Crypto ${PULSEAUDIO_LIBRARIES} ${AVCODEC_LIBRARIES}
+ )
+ 
+ qt_add_executable(librepods-ctl
+diff --git a/daemon/main.cpp b/daemon/main.cpp
+index e355913..4cadb74 100644
+--- a/daemon/main.cpp
++++ b/daemon/main.cpp
+@@ -32,6 +32,7 @@
+ #include "airpods_packets.h"
+ #include "logger.h"
+ #include "media/hiresframe.hpp"
++#include "media/hiresmic.h"
+ #include "media/mediacontroller.h"
+ #include "trayiconmanager.h"
+ #include "notifier.hpp"
+@@ -392,6 +393,13 @@ public slots:
+             LOG_WARN("Refusing hi-res mic " << (enabled ? "arm" : "disarm") << ": no control link");
+             return;
+         }
++        if (enabled && !m_hiResMic.start()) {
++            LOG_ERROR("Refusing hi-res mic arm: decoder or source unavailable");
++            return;
++        }
++        if (!enabled) {
++            m_hiResMic.stop();
++        }
+         m_hiResMicArmed = enabled;
+         m_hiResSdus = 0;
+         m_hiResUnits = 0;
+@@ -404,16 +412,18 @@ public slots:
+     void handleHiResAudio(const QByteArray &sdu)
+     {
+         qsizetype consumed = OpenPods::HiRes::kSduHeaderLen;
+-        const int units = OpenPods::HiRes::demuxAudioUnits(sdu, [&consumed](QByteArrayView au) {
++        const int units = OpenPods::HiRes::demuxAudioUnits(sdu, [this, &consumed](QByteArrayView au) {
+             consumed += OpenPods::HiRes::kAuPrefixLen + au.size();
++            m_hiResMic.decode(au);
+         });
+         ++m_hiResSdus;
+         m_hiResUnits += units;
+         m_hiResTailBytes += sdu.size() - consumed;
+         if (m_hiResSdus % 100 == 0) {
+             LOG_INFO("Hi-res mic: " << m_hiResSdus << " SDUs, " << m_hiResUnits
+-                     << " access units, " << m_hiResTailBytes << " bytes left unparsed, last SDU "
+-                     << sdu.size() << " bytes");
++                     << " access units, " << m_hiResMic.framesDecoded() << " frames decoded, "
++                     << m_hiResMic.decodeErrors() << " errors, " << m_hiResTailBytes
++                     << " bytes left unparsed");
+         }
+     }
+ 
+@@ -1666,6 +1676,7 @@ signals:
+     void hearingAidEnabledChanged(bool enabled);
+ 
+ private:
++    HiResMic m_hiResMic;
+     bool m_hiResMicArmed = false;
+     quint64 m_hiResSdus = 0;
+     quint64 m_hiResUnits = 0;
+diff --git a/daemon/media/eldpcm.hpp b/daemon/media/eldpcm.hpp
+new file mode 100644
+index 0000000..3809d16
+--- /dev/null
++++ b/daemon/media/eldpcm.hpp
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <QtGlobal>
++#include <cmath>
++
++// Sample conversion for the AAC-ELD uplink, kept out of the decoder so it is testable where
++// tests link Qt6::Core alone.
++namespace OpenPods::HiRes
++{
++    // The AirPods uplink: AOT 39, mono, 480-sample frames of 7.5 ms, decoded at 64 kHz.
++    inline constexpr int kEldSampleRate = 64000;
++    inline constexpr int kEldFrameSamples = 480;
++    inline constexpr int kEldChannels = 1;
++
++    // libavcodec hands back planar floats; module-pipe-source is fed s16, so each sample is
++    // clamped before scaling. Without the clamp an overdriven frame wraps to the opposite sign.
++    inline qint16 floatToS16(float sample)
++    {
++        const float clamped = sample < -1.0f ? -1.0f : (sample > 1.0f ? 1.0f : sample);
++        return static_cast<qint16>(std::lround(clamped * 32767.0f));
++    }
++}
+diff --git a/daemon/media/hiresmic.cpp b/daemon/media/hiresmic.cpp
+new file mode 100644
+index 0000000..8228a23
+--- /dev/null
++++ b/daemon/media/hiresmic.cpp
+@@ -0,0 +1,180 @@
++#include "hiresmic.h"
++
++#include "eldpcm.hpp"
++#include "../logger.h"
++
++#include <QDir>
++#include <QFile>
++#include <QProcess>
++#include <QStandardPaths>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavutil/mem.h>
++}
++
++namespace {
++// AudioSpecificConfig for the uplink: AOT 39 (AAC-ELD), 480-sample frames.
++constexpr quint8 kEldAsc[] = {0xF8, 0xE6, 0x30, 0x00};
++// The stream decodes to 64 kHz, but its coding rate is 48 kHz and the decoder needs that one.
++constexpr int kEldCodingRate = 48000;
++constexpr const char *kSourceName = "AirPodsHiRes";
++}
++
++HiResMic::HiResMic(QObject *parent) : QObject(parent) {}
++
++HiResMic::~HiResMic()
++{
++    stop();
++}
++
++QString HiResMic::fifoPath() const
++{
++    const QString runtime = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
++    return runtime + "/librepods-hires.fifo";
++}
++
++bool HiResMic::openDecoder()
++{
++    av_log_set_level(AV_LOG_FATAL);
++    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
++    if (!codec) {
++        LOG_ERROR("No AAC decoder in this libavcodec, cannot decode the hi-res uplink");
++        return false;
++    }
++    m_ctx = avcodec_alloc_context3(codec);
++    m_frame = av_frame_alloc();
++    m_pkt = av_packet_alloc();
++    if (!m_ctx || !m_frame || !m_pkt) {
++        closeDecoder();
++        return false;
++    }
++    m_ctx->extradata = static_cast<uint8_t *>(av_mallocz(sizeof(kEldAsc) + AV_INPUT_BUFFER_PADDING_SIZE));
++    if (!m_ctx->extradata) {
++        closeDecoder();
++        return false;
++    }
++    memcpy(m_ctx->extradata, kEldAsc, sizeof(kEldAsc));
++    m_ctx->extradata_size = sizeof(kEldAsc);
++    m_ctx->sample_rate = kEldCodingRate;
++    if (avcodec_open2(m_ctx, codec, nullptr) < 0) {
++        LOG_ERROR("Could not open the AAC-ELD decoder");
++        closeDecoder();
++        return false;
++    }
++    return true;
++}
++
++void HiResMic::closeDecoder()
++{
++    if (m_pkt) av_packet_free(&m_pkt);
++    if (m_frame) av_frame_free(&m_frame);
++    if (m_ctx) avcodec_free_context(&m_ctx);
++}
++
++bool HiResMic::publishSource()
++{
++    const QString fifo = fifoPath();
++    QFile::remove(fifo);
++    if (mkfifo(fifo.toLocal8Bit().constData(), 0600) != 0) {
++        LOG_ERROR("Could not create the hi-res fifo at " << fifo);
++        return false;
++    }
++    // Opened read-write so the writer never blocks waiting for a reader to appear.
++    m_fifo = open(fifo.toLocal8Bit().constData(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++    if (m_fifo < 0) {
++        LOG_ERROR("Could not open the hi-res fifo at " << fifo);
++        QFile::remove(fifo);
++        return false;
++    }
++
++    QProcess pactl;
++    pactl.start("pactl", {"load-module", "module-pipe-source",
++                          QStringLiteral("source_name=%1").arg(kSourceName),
++                          QStringLiteral("file=%1").arg(fifo),
++                          "format=s16le",
++                          QStringLiteral("rate=%1").arg(OpenPods::HiRes::kEldSampleRate),
++                          QStringLiteral("channels=%1").arg(OpenPods::HiRes::kEldChannels)});
++    if (!pactl.waitForFinished(5000) || pactl.exitCode() != 0) {
++        LOG_ERROR("pactl refused module-pipe-source: " << pactl.readAllStandardError().trimmed());
++        ::close(m_fifo);
++        m_fifo = -1;
++        QFile::remove(fifo);
++        return false;
++    }
++    m_module = pactl.readAllStandardOutput().trimmed().toUInt();
++    LOG_INFO("Hi-res mic source '" << kSourceName << "' ready, module " << m_module);
++    return m_module > 0;
++}
++
++void HiResMic::unpublishSource()
++{
++    if (m_module > 0) {
++        QProcess::execute("pactl", {"unload-module", QString::number(m_module)});
++        m_module = 0;
++    }
++    if (m_fifo >= 0) {
++        ::close(m_fifo);
++        m_fifo = -1;
++    }
++    QFile::remove(fifoPath());
++}
++
++bool HiResMic::start()
++{
++    if (isRunning()) {
++        return true;
++    }
++    if (!openDecoder()) {
++        return false;
++    }
++    if (!publishSource()) {
++        closeDecoder();
++        return false;
++    }
++    m_frames = 0;
++    m_errors = 0;
++    return true;
++}
++
++void HiResMic::stop()
++{
++    unpublishSource();
++    closeDecoder();
++}
++
++void HiResMic::decode(QByteArrayView accessUnit)
++{
++    if (!m_ctx || m_fifo < 0 || accessUnit.isEmpty()) {
++        return;
++    }
++    // av_packet_from_data wants a padded, writable buffer, so the unit is copied into one.
++    QByteArray padded(accessUnit.size() + AV_INPUT_BUFFER_PADDING_SIZE, '\0');
++    memcpy(padded.data(), accessUnit.data(), accessUnit.size());
++    m_pkt->data = reinterpret_cast<uint8_t *>(padded.data());
++    m_pkt->size = static_cast<int>(accessUnit.size());
++
++    if (avcodec_send_packet(m_ctx, m_pkt) < 0) {
++        ++m_errors;
++        return;
++    }
++    while (avcodec_receive_frame(m_ctx, m_frame) == 0) {
++        const int samples = m_frame->nb_samples;
++        QByteArray pcm(samples * static_cast<int>(sizeof(qint16)), '\0');
++        auto *out = reinterpret_cast<qint16 *>(pcm.data());
++        const auto *in = reinterpret_cast<const float *>(m_frame->extended_data[0]);
++        for (int i = 0; i < samples; ++i) {
++            out[i] = OpenPods::HiRes::floatToS16(in[i]);
++        }
++        // A reader that stopped draining must not stall the control link, so a full pipe drops.
++        const ssize_t written = ::write(m_fifo, pcm.constData(), pcm.size());
++        if (written < 0 && errno != EAGAIN) {
++            ++m_errors;
++        }
++        ++m_frames;
++    }
++}
+diff --git a/daemon/media/hiresmic.h b/daemon/media/hiresmic.h
+new file mode 100644
+index 0000000..fc9e114
+--- /dev/null
++++ b/daemon/media/hiresmic.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++#include <QByteArrayView>
++#include <QObject>
++#include <QString>
++
++struct AVCodecContext;
++struct AVFrame;
++struct AVPacket;
++
++// Decodes the AirPods AAC-ELD uplink and feeds it to a PipeWire source, so the AirPods
++// microphone is available while playback stays on A2DP.
++class HiResMic : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit HiResMic(QObject *parent = nullptr);
++    ~HiResMic() override;
++
++    // Opens the decoder and publishes the source. False leaves nothing behind.
++    bool start();
++    void stop();
++    bool isRunning() const { return m_module > 0; }
++
++    // One AAC-ELD access unit from an 0x58 audio SDU.
++    void decode(QByteArrayView accessUnit);
++
++    quint64 framesDecoded() const { return m_frames; }
++    quint64 decodeErrors() const { return m_errors; }
++
++private:
++    bool openDecoder();
++    void closeDecoder();
++    bool publishSource();
++    void unpublishSource();
++    QString fifoPath() const;
++
++    AVCodecContext *m_ctx = nullptr;
++    AVFrame *m_frame = nullptr;
++    AVPacket *m_pkt = nullptr;
++    int m_fifo = -1;
++    unsigned m_module = 0;
++    quint64 m_frames = 0;
++    quint64 m_errors = 0;
++};
+-- 
+2.56.0
+

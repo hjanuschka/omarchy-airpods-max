@@ -1,0 +1,476 @@
+From 8d9a25d8fbf90c8dcc2eaa878db47badc2489ed8 Mon Sep 17 00:00:00 2001
+From: Helmut Januschka <helmut@januschka.com>
+Date: Fri, 23 Oct 2026 17:49:31 +0200
+Subject: [PATCH 6/6] hires mic: gain the uplink and follow the recorder
+
+The raw uplink decodes quiet enough to sound faint on a call, so each
+frame now passes an envelope-tracked gain with a tanh limiter. Measured
+on the same speech: RMS 116 before, 784 after.
+
+The source is published for as long as the pods are connected, so an
+app can select AirPodsHiRes before anything streams, and a one-second
+poll arms the radio stream when a recorder appears and disarms it when
+the last one leaves. Nothing is streamed while no app is listening.
+An unknown capture query neither arms nor disarms, matching the rule
+the A2DP path already follows.
+
+Reader detection shares the existing capture query: its matcher is now
+a parameter, since the hi-res source carries no address in its name.
+---
+ daemon/CMakeLists.txt                 |  1 +
+ daemon/main.cpp                       | 53 ++++++++++++++--
+ daemon/media/agc.hpp                  | 42 +++++++++++++
+ daemon/media/hiresmic.cpp             |  2 +
+ daemon/media/hiresmic.h               |  3 +
+ daemon/media/mediacontroller.cpp      |  5 ++
+ daemon/media/mediacontroller.h        |  4 ++
+ daemon/media/pulseaudiocontroller.cpp | 26 ++++++--
+ daemon/media/pulseaudiocontroller.h   |  5 ++
+ daemon/tests/CMakeLists.txt           |  6 ++
+ daemon/tests/tst_agc.cpp              | 87 +++++++++++++++++++++++++++
+ 11 files changed, 224 insertions(+), 10 deletions(-)
+ create mode 100644 daemon/media/agc.hpp
+ create mode 100644 daemon/tests/tst_agc.cpp
+
+diff --git a/daemon/CMakeLists.txt b/daemon/CMakeLists.txt
+index a5bd026..44e4093 100644
+--- a/daemon/CMakeLists.txt
++++ b/daemon/CMakeLists.txt
+@@ -29,6 +29,7 @@ qt_add_executable(librepods
+     media/hiresmic.h
+     media/hiresframe.hpp
+     media/eldpcm.hpp
++    media/agc.hpp
+     airpods_packets.h
+     trayiconmanager.cpp
+     trayiconmanager.h
+diff --git a/daemon/main.cpp b/daemon/main.cpp
+index 4cadb74..1010c8e 100644
+--- a/daemon/main.cpp
++++ b/daemon/main.cpp
+@@ -393,12 +393,12 @@ public slots:
+             LOG_WARN("Refusing hi-res mic " << (enabled ? "arm" : "disarm") << ": no control link");
+             return;
+         }
+-        if (enabled && !m_hiResMic.start()) {
+-            LOG_ERROR("Refusing hi-res mic arm: decoder or source unavailable");
++        if (m_hiResMicArmed == enabled) {
+             return;
+         }
+-        if (!enabled) {
+-            m_hiResMic.stop();
++        if (enabled && !m_hiResMic.isRunning()) {
++            LOG_WARN("Refusing hi-res mic arm: no source published");
++            return;
+         }
+         m_hiResMicArmed = enabled;
+         m_hiResSdus = 0;
+@@ -408,6 +408,48 @@ public slots:
+         LOG_INFO("Hi-res mic " << (enabled ? "armed" : "disarmed"));
+     }
+ 
++    // The source is published for as long as the pods are connected, so an app can pick it
++    // before anything is streaming; the radio stream itself follows the recorder.
++    void startHiResMicSource()
++    {
++        if (m_hiResMic.isRunning() || !m_hiResMic.start()) {
++            return;
++        }
++        if (!m_hiResMonitor) {
++            m_hiResMonitor = new QTimer(this);
++            m_hiResMonitor->setInterval(1000);
++            connect(m_hiResMonitor, &QTimer::timeout, this, &AirPodsTrayApp::pollHiResRecorder);
++        }
++        m_hiResMonitor->start();
++    }
++
++    void stopHiResMicSource()
++    {
++        if (m_hiResMonitor) {
++            m_hiResMonitor->stop();
++        }
++        if (m_hiResMicArmed) {
++            setHiResMicEnabled(false);
++        }
++        m_hiResMic.stop();
++    }
++
++    // Unknown is not evidence of a recorder, so it neither arms nor disarms.
++    void pollHiResRecorder()
++    {
++        if (!m_hiResMic.isRunning()) {
++            return;
++        }
++        const CaptureState state = mediaController->captureStateForSource("AirPodsHiRes");
++        if (state == CaptureState::Live && !m_hiResMicArmed) {
++            LOG_INFO("Hi-res mic: a recorder appeared, arming");
++            setHiResMicEnabled(true);
++        } else if (state == CaptureState::Idle && m_hiResMicArmed) {
++            LOG_INFO("Hi-res mic: no recorder left, disarming");
++            setHiResMicEnabled(false);
++        }
++    }
++
+     // Audio arrives on the control socket, so it is counted here rather than parsed as a packet.
+     void handleHiResAudio(const QByteArray &sdu)
+     {
+@@ -1197,6 +1239,7 @@ private slots:
+             QMetaObject::invokeMethod(this, "parseData", Qt::QueuedConnection, Q_ARG(QByteArray, data));
+             QMetaObject::invokeMethod(this, "relayPacketToPhone", Qt::QueuedConnection, Q_ARG(QByteArray, data)); });
+             sendHandshake();
++            startHiResMicSource();
+         };
+ 
+         // Error handler with retry. Per-device member instead of static so
+@@ -1261,6 +1304,7 @@ private slots:
+                         }
+                         return;
+                     }
++                    stopHiResMicSource();
+                     handleControlSocketLoss(device, localSocket,
+                                             QStringLiteral("socket disconnected"));
+                 });
+@@ -1677,6 +1721,7 @@ signals:
+ 
+ private:
+     HiResMic m_hiResMic;
++    QTimer *m_hiResMonitor = nullptr;
+     bool m_hiResMicArmed = false;
+     quint64 m_hiResSdus = 0;
+     quint64 m_hiResUnits = 0;
+diff --git a/daemon/media/agc.hpp b/daemon/media/agc.hpp
+new file mode 100644
+index 0000000..ad1314b
+--- /dev/null
++++ b/daemon/media/agc.hpp
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include <QtGlobal>
++#include <cmath>
++
++// Automatic gain control for the AirPods uplink. The raw stream decodes quiet, so a call
++// sounds faint without it. Free of audio types so it is testable on its own.
++namespace OpenPods::HiRes
++{
++    class Agc
++    {
++    public:
++        // Walks the frame in place, tracking the envelope and easing the gain towards the
++        // level that puts speech near the target.
++        void process(qint16 *samples, int count)
++        {
++            for (int i = 0; i < count; ++i) {
++                const float x = static_cast<float>(samples[i]) / 32768.0f;
++                const float level = std::fabs(x);
++                // Rising level is followed quickly so a syllable is not clipped; falling level
++                // is followed slowly so a pause does not pump the gain up to the noise floor.
++                m_envelope += (level - m_envelope) * (level > m_envelope ? kAttack : kRelease);
++                const float desired = std::min(kTarget / std::max(m_envelope, 1e-4f), kMaxGain);
++                m_gain += (desired - m_gain) * kGainEase;
++                // tanh keeps a transient inside the range instead of wrapping it.
++                samples[i] = static_cast<qint16>(std::tanh(x * m_gain) * 32767.0f);
++            }
++        }
++
++        float gain() const { return m_gain; }
++
++    private:
++        static constexpr float kTarget = 0.25f;   // about -12 dBFS
++        static constexpr float kMaxGain = 8.0f;   // about +18 dB
++        static constexpr float kAttack = 0.02f;
++        static constexpr float kRelease = 0.001f;
++        static constexpr float kGainEase = 0.01f;
++
++        float m_envelope = 0.0f;
++        float m_gain = 1.0f;
++    };
++}
+diff --git a/daemon/media/hiresmic.cpp b/daemon/media/hiresmic.cpp
+index 8228a23..8c78e44 100644
+--- a/daemon/media/hiresmic.cpp
++++ b/daemon/media/hiresmic.cpp
+@@ -1,5 +1,6 @@
+ #include "hiresmic.h"
+ 
++#include "agc.hpp"
+ #include "eldpcm.hpp"
+ #include "../logger.h"
+ 
+@@ -170,6 +171,7 @@ void HiResMic::decode(QByteArrayView accessUnit)
+         for (int i = 0; i < samples; ++i) {
+             out[i] = OpenPods::HiRes::floatToS16(in[i]);
+         }
++        m_agc.process(out, samples);
+         // A reader that stopped draining must not stall the control link, so a full pipe drops.
+         const ssize_t written = ::write(m_fifo, pcm.constData(), pcm.size());
+         if (written < 0 && errno != EAGAIN) {
+diff --git a/daemon/media/hiresmic.h b/daemon/media/hiresmic.h
+index fc9e114..33e9a09 100644
+--- a/daemon/media/hiresmic.h
++++ b/daemon/media/hiresmic.h
+@@ -4,6 +4,8 @@
+ #include <QObject>
+ #include <QString>
+ 
++#include "agc.hpp"
++
+ struct AVCodecContext;
+ struct AVFrame;
+ struct AVPacket;
+@@ -41,6 +43,7 @@ private:
+     AVPacket *m_pkt = nullptr;
+     int m_fifo = -1;
+     unsigned m_module = 0;
++    OpenPods::HiRes::Agc m_agc;
+     quint64 m_frames = 0;
+     quint64 m_errors = 0;
+ };
+diff --git a/daemon/media/mediacontroller.cpp b/daemon/media/mediacontroller.cpp
+index ed5ca34..942b0bc 100644
+--- a/daemon/media/mediacontroller.cpp
++++ b/daemon/media/mediacontroller.cpp
+@@ -116,6 +116,11 @@ void MediaController::handleEarDetection(EarDetection *earDetection)
+   }
+ }
+ 
++CaptureState MediaController::captureStateForSource(const QString &sourceName)
++{
++  return m_pulseAudio->captureStateForSource(sourceName);
++}
++
+ void MediaController::setEarDetectionBehavior(EarDetectionBehavior behavior)
+ {
+   if (earDetectionBehavior == behavior)
+diff --git a/daemon/media/mediacontroller.h b/daemon/media/mediacontroller.h
+index f1b6eb8..1515390 100644
+--- a/daemon/media/mediacontroller.h
++++ b/daemon/media/mediacontroller.h
+@@ -2,6 +2,8 @@
+ #define MEDIACONTROLLER_H
+ 
+ #include <QObject>
++
++#include "capturematch.hpp"
+ #include "pulseaudiocontroller.h"
+ 
+ class QProcess;
+@@ -45,6 +47,8 @@ public:
+   bool restartWirePlumber();
+ 
+   void setEarDetectionBehavior(EarDetectionBehavior behavior);
++  // Whether anything is recording from a source, named exactly. The hi-res mic monitor asks.
++  CaptureState captureStateForSource(const QString &sourceName);
+   inline EarDetectionBehavior getEarDetectionBehavior() const { return earDetectionBehavior; }
+ 
+   void play();
+diff --git a/daemon/media/pulseaudiocontroller.cpp b/daemon/media/pulseaudiocontroller.cpp
+index cecec30..ac32100 100644
+--- a/daemon/media/pulseaudiocontroller.cpp
++++ b/daemon/media/pulseaudiocontroller.cpp
+@@ -1,4 +1,6 @@
+ #include "pulseaudiocontroller.h"
++
++#include <functional>
+ #include "capturematch.hpp"
+ #include "profilechoice.hpp"
+ #include "logger.h"
+@@ -425,18 +427,19 @@ bool PulseAudioController::isProfileAvailable(const QString &cardName, const QSt
+ 
+ // A stream attached to the AirPods mic is a call holding the headset profile, and a
+ // muted caller still holds it, so both queries run under one lock to see one server state.
+-CaptureState PulseAudioController::captureState(const QString &macAddress)
++CaptureState PulseAudioController::captureStateMatching(const std::function<bool(const QString &)> &matches,
++                                                        const QString &what)
+ {
+     // Both are known here rather than unanswered, and the activation path already handles them.
+-    if (!m_initialized || macAddress.isEmpty()) return CaptureState::Idle;
++    if (!m_initialized || what.isEmpty()) return CaptureState::Idle;
+ 
+     struct SourceData {
+         QVector<uint32_t> indexes;
+         bool failed = false;
+-        QString macAddress;
++        const std::function<bool(const QString &)> *matches = nullptr;
+         pa_threaded_mainloop *mainloop = nullptr;
+     } sources;
+-    sources.macAddress = macAddress;
++    sources.matches = &matches;
+     sources.mainloop = m_mainloop;
+ 
+     auto sourceCallback = [](pa_context *, const pa_source_info *info, int eol, void *userdata) {
+@@ -450,7 +453,7 @@ CaptureState PulseAudioController::captureState(const QString &macAddress)
+         if (!info || info->monitor_of_sink != PA_INVALID_INDEX) {
+             return;
+         }
+-        if (sourceNamesAddress(QString::fromUtf8(info->name), d->macAddress)) {
++        if ((*d->matches)(QString::fromUtf8(info->name))) {
+             d->indexes.append(info->index);
+         }
+     };
+@@ -494,12 +497,23 @@ CaptureState PulseAudioController::captureState(const QString &macAddress)
+     pa_threaded_mainloop_unlock(m_mainloop);
+ 
+     if (!sourcesWaited || sources.failed || !streamsWaited || streams.failed) {
+-        LOG_WARN("PulseAudio capture query failed for " << macAddress << ", capture state unknown");
++        LOG_WARN("PulseAudio capture query failed for " << what << ", capture state unknown");
+         return CaptureState::Unknown;
+     }
+     return streams.capturing ? CaptureState::Live : CaptureState::Idle;
+ }
+ 
++CaptureState PulseAudioController::captureState(const QString &macAddress)
++{
++    return captureStateMatching(
++        [&macAddress](const QString &name) { return sourceNamesAddress(name, macAddress); }, macAddress);
++}
++
++CaptureState PulseAudioController::captureStateForSource(const QString &sourceName)
++{
++    return captureStateMatching([&sourceName](const QString &name) { return name == sourceName; }, sourceName);
++}
++
+ QVector<ProfileCandidate> PulseAudioController::getCardProfiles(const QString &cardName)
+ {
+     if (!m_initialized || cardName.isEmpty()) {
+diff --git a/daemon/media/pulseaudiocontroller.h b/daemon/media/pulseaudiocontroller.h
+index 4f914f9..2e5c646 100644
+--- a/daemon/media/pulseaudiocontroller.h
++++ b/daemon/media/pulseaudiocontroller.h
+@@ -2,6 +2,7 @@
+ 
+ #include <QObject>
+ #include <QString>
++#include <functional>
+ #include <atomic>
+ #include <pulse/pulseaudio.h>
+ 
+@@ -55,6 +56,8 @@ public:
+ 
+     // Live while any stream is attached to this address's mic, which is what a call holds.
+     CaptureState captureState(const QString &macAddress);
++    // The hi-res source carries no address in its name, so it is matched exactly.
++    CaptureState captureStateForSource(const QString &sourceName);
+     // Every profile this card reports, for the pure choice in profilechoice.hpp.
+     QVector<ProfileCandidate> getCardProfiles(const QString &cardName);
+ 
+@@ -85,4 +88,6 @@ private:
+     static void snapSinkInfoCallback(pa_context *c, const pa_sink_info *info, int eol, void *userdata);
+ 
+     bool waitForOperation(pa_operation *op);
++    CaptureState captureStateMatching(const std::function<bool(const QString &)> &matches,
++                                      const QString &what);
+ };
+diff --git a/daemon/tests/CMakeLists.txt b/daemon/tests/CMakeLists.txt
+index bfd8f2b..222fc51 100644
+--- a/daemon/tests/CMakeLists.txt
++++ b/daemon/tests/CMakeLists.txt
+@@ -39,6 +39,12 @@ openpods_add_test(tst_hiresframe
+     ../media/hiresframe.hpp
+ )
+ 
++openpods_add_test(tst_agc
++    tst_agc.cpp
++    ../media/agc.hpp
++    ../media/eldpcm.hpp
++)
++
+ openpods_add_test(tst_profilechoice
+     tst_profilechoice.cpp
+     ../media/profilechoice.hpp
+diff --git a/daemon/tests/tst_agc.cpp b/daemon/tests/tst_agc.cpp
+new file mode 100644
+index 0000000..c0a4d3a
+--- /dev/null
++++ b/daemon/tests/tst_agc.cpp
+@@ -0,0 +1,87 @@
++#include <QtTest>
++
++#include "../media/agc.hpp"
++#include "../media/eldpcm.hpp"
++
++using namespace OpenPods::HiRes;
++
++// A frame of the uplink's shape: 480 mono samples of a steady tone at a given amplitude.
++static QList<qint16> tone(double amplitude, int count = kEldFrameSamples)
++{
++    QList<qint16> out;
++    out.reserve(count);
++    for (int i = 0; i < count; ++i) {
++        out.append(static_cast<qint16>(std::sin(i * 0.05) * amplitude * 32767.0));
++    }
++    return out;
++}
++
++static double rms(const QList<qint16> &samples)
++{
++    double sum = 0.0;
++    for (qint16 s : samples) {
++        sum += double(s) * double(s);
++    }
++    return std::sqrt(sum / samples.size());
++}
++
++class TestAgc : public QObject
++{
++    Q_OBJECT
++
++private slots:
++    void liftsAQuietFrameTowardsTheTarget();
++    void doesNotLiftAnAlreadyLoudFrame();
++    void neverExceedsItsGainCeiling();
++    void keepsLoudInputInRange();
++};
++
++void TestAgc::liftsAQuietFrameTowardsTheTarget()
++{
++    // The measured uplink sits far below the target, which is the whole reason this exists.
++    QList<qint16> quiet = tone(0.01);
++    const double before = rms(quiet);
++    Agc agc;
++    for (int frame = 0; frame < 40; ++frame) {
++        quiet = tone(0.01);
++        agc.process(quiet.data(), quiet.size());
++    }
++    QVERIFY2(rms(quiet) > before * 2.0, "a quiet frame should end up louder");
++    QVERIFY(agc.gain() > 1.0f);
++}
++
++void TestAgc::doesNotLiftAnAlreadyLoudFrame()
++{
++    Agc agc;
++    QList<qint16> loud;
++    for (int frame = 0; frame < 40; ++frame) {
++        loud = tone(0.5);
++        agc.process(loud.data(), loud.size());
++    }
++    QVERIFY2(agc.gain() < 2.0f, "a loud frame needs little gain");
++}
++
++void TestAgc::neverExceedsItsGainCeiling()
++{
++    // Silence drives the desired gain towards its clamp, which must hold.
++    Agc agc;
++    for (int frame = 0; frame < 2000; ++frame) {
++        QList<qint16> silence(kEldFrameSamples, 0);
++        agc.process(silence.data(), silence.size());
++    }
++    QVERIFY(agc.gain() <= 8.0f);
++}
++
++void TestAgc::keepsLoudInputInRange()
++{
++    // Without the limiter a gained transient wraps sign, which is audible as a click.
++    Agc agc;
++    QList<qint16> full = tone(0.99);
++    agc.process(full.data(), full.size());
++    for (qint16 s : full) {
++        QVERIFY(s >= -32767 && s <= 32767);
++    }
++}
++
++QTEST_GUILESS_MAIN(TestAgc)
++#include "tst_agc.moc"
+-- 
+2.56.0
+

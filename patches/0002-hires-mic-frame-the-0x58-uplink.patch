@@ -1,0 +1,191 @@
+From b4f12af741821a4c7cef9b6f43c6d5931f7a21b7 Mon Sep 17 00:00:00 2001
+From: Helmut Januschka <helmut@januschka.com>
+Date: Fri, 23 Oct 2026 16:55:05 +0200
+Subject: [PATCH 3/6] hires mic: frame the 0x58 uplink
+
+The AirPods carry their high-resolution microphone as AACP message type
+0x58 subtype 0x0001 on the L2CAP PSM 0x1001 socket this daemon already
+owns, so the frames arrive today and are discarded as unknown. This adds
+the framing only: the subtype predicate that keeps the start and stop
+control packets out of the decoder, and the walk over the 22-byte header
+and its [timestamp u32][length u8][AU] repetitions.
+
+Both are free of Bluetooth and PulseAudio types, so they are testable
+where tests link Qt6::Core alone.
+
+The callback is not called `emit`. It was at first, and Qt's macro
+expanded the call away: the unit counter still advanced while nothing
+was ever passed on, which tst_hiresframe caught.
+---
+ daemon/media/hiresframe.hpp     | 49 +++++++++++++++++++
+ daemon/tests/CMakeLists.txt     |  5 ++
+ daemon/tests/tst_hiresframe.cpp | 85 +++++++++++++++++++++++++++++++++
+ 3 files changed, 139 insertions(+)
+ create mode 100644 daemon/media/hiresframe.hpp
+ create mode 100644 daemon/tests/tst_hiresframe.cpp
+
+diff --git a/daemon/media/hiresframe.hpp b/daemon/media/hiresframe.hpp
+new file mode 100644
+index 0000000..a9d23e7
+--- /dev/null
++++ b/daemon/media/hiresframe.hpp
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <QByteArrayView>
++#include <functional>
++
++// AACP framing for the AirPods hi-res microphone uplink: message type 0x58,
++// subtype 0x0001, carried on the same L2CAP PSM 0x1001 socket the daemon owns.
++// Free of Bluetooth and PulseAudio types so the framing is testable on its own.
++namespace OpenPods::HiRes
++{
++    // 22-byte header, then N repetitions of [timestamp u32 LE][length u8][AAC-ELD AU].
++    inline constexpr qsizetype kSduHeaderLen = 22;
++    inline constexpr qsizetype kAuPrefixLen = 5;
++
++    inline quint16 u16le(QByteArrayView b, qsizetype off)
++    {
++        return static_cast<quint16>(static_cast<quint8>(b[off]))
++             | static_cast<quint16>(static_cast<quint8>(b[off + 1])) << 8;
++    }
++
++    // Control frames share message type 0x58, so the subtype is what separates audio from them.
++    inline bool isAudioSdu(QByteArrayView sdu)
++    {
++        return sdu.size() >= 8
++            && static_cast<quint8>(sdu[0]) == 0x04
++            && static_cast<quint8>(sdu[2]) == 0x04
++            && u16le(sdu, 4) == 0x58
++            && u16le(sdu, 6) == 0x0001;
++    }
++
++    // Walks the access units of one audio SDU and returns how many were passed on. A truncated
++    // tail ends the walk: an SDU read into too small a buffer must not yield a partial unit.
++    // The callback is not named `emit`: Qt defines that as a macro, which swallows the call.
++    inline int demuxAudioUnits(QByteArrayView sdu, const std::function<void(QByteArrayView)> &onUnit)
++    {
++        int units = 0;
++        for (qsizetype off = kSduHeaderLen; off + kAuPrefixLen <= sdu.size();) {
++            const qsizetype length = static_cast<quint8>(sdu[off + 4]);
++            const qsizetype start = off + kAuPrefixLen;
++            if (start + length > sdu.size()) {
++                break;
++            }
++            onUnit(sdu.sliced(start, length));
++            ++units;
++            off = start + length;
++        }
++        return units;
++    }
++}
+diff --git a/daemon/tests/CMakeLists.txt b/daemon/tests/CMakeLists.txt
+index 7dcf7d1..bfd8f2b 100644
+--- a/daemon/tests/CMakeLists.txt
++++ b/daemon/tests/CMakeLists.txt
+@@ -34,6 +34,11 @@ openpods_add_test(tst_capturematch
+     ../media/capturematch.hpp
+ )
+ 
++openpods_add_test(tst_hiresframe
++    tst_hiresframe.cpp
++    ../media/hiresframe.hpp
++)
++
+ openpods_add_test(tst_profilechoice
+     tst_profilechoice.cpp
+     ../media/profilechoice.hpp
+diff --git a/daemon/tests/tst_hiresframe.cpp b/daemon/tests/tst_hiresframe.cpp
+new file mode 100644
+index 0000000..b3509ef
+--- /dev/null
++++ b/daemon/tests/tst_hiresframe.cpp
+@@ -0,0 +1,85 @@
++#include <QtTest>
++
++#include "../media/hiresframe.hpp"
++
++using namespace OpenPods::HiRes;
++
++// SDUs in the shape the AirPods send them: 04 00 04 00, message type 0x58, then the subtype.
++static QByteArray sdu(quint16 subtype, const QList<QByteArray> &units, qsizetype headerLen = kSduHeaderLen)
++{
++    QByteArray out;
++    out.append(QByteArray::fromHex("04000400"));
++    out.append(static_cast<char>(0x58));
++    out.append('\0');
++    out.append(static_cast<char>(subtype & 0xff));
++    out.append(static_cast<char>(subtype >> 8));
++    out.append(QByteArray(headerLen - out.size(), '\0'));
++    for (const QByteArray &unit : units) {
++        out.append(QByteArray(4, '\0'));  // timestamp
++        out.append(static_cast<char>(unit.size()));
++        out.append(unit);
++    }
++    return out;
++}
++
++class TestHiResFrame : public QObject
++{
++    Q_OBJECT
++
++private slots:
++    void acceptsAnAudioSdu();
++    void rejectsTheControlSubtype();
++    void rejectsShortAndForeignFrames();
++    void demuxesEveryAccessUnit();
++    void stopsOnATruncatedAccessUnit();
++    void emitsNothingFromAHeaderOnlySdu();
++};
++
++void TestHiResFrame::acceptsAnAudioSdu()
++{
++    QVERIFY(isAudioSdu(sdu(0x0001, {QByteArray(8, 'a')})));
++}
++
++void TestHiResFrame::rejectsTheControlSubtype()
++{
++    // The start and stop packets are type 0x58 too, so only the subtype keeps them out of the decoder.
++    QVERIFY(!isAudioSdu(QByteArray::fromHex("040004005800000009000001")));
++    QVERIFY(!isAudioSdu(sdu(0x0000, {QByteArray(8, 'a')})));
++    QVERIFY(!isAudioSdu(sdu(0x0003, {QByteArray(8, 'a')})));
++}
++
++void TestHiResFrame::rejectsShortAndForeignFrames()
++{
++    QVERIFY(!isAudioSdu(QByteArray::fromHex("0400040058")));           // shorter than the subtype
++    QVERIFY(!isAudioSdu(QByteArray()));
++    QVERIFY(!isAudioSdu(QByteArray::fromHex("040004000e0001000000"))); // battery, another message type
++}
++
++void TestHiResFrame::demuxesEveryAccessUnit()
++{
++    const QByteArray first(40, '\x11');
++    const QByteArray second(37, '\x22');
++    QList<QByteArray> seen;
++    const int count = demuxAudioUnits(sdu(0x0001, {first, second}),
++                                      [&seen](QByteArrayView au) { seen.append(au.toByteArray()); });
++    QCOMPARE(count, 2);
++    QCOMPARE(seen, QList<QByteArray>({first, second}));
++}
++
++void TestHiResFrame::stopsOnATruncatedAccessUnit()
++{
++    // A 4096-byte read buffer can still cut an SDU, and half an access unit is not decodable.
++    QByteArray frame = sdu(0x0001, {QByteArray(40, '\x11'), QByteArray(40, '\x22')});
++    frame.chop(12);
++    int count = 0;
++    count = demuxAudioUnits(frame, [&count](QByteArrayView) { });
++    QCOMPARE(count, 1);
++}
++
++void TestHiResFrame::emitsNothingFromAHeaderOnlySdu()
++{
++    QCOMPARE(demuxAudioUnits(sdu(0x0001, {}), [](QByteArrayView) { }), 0);
++}
++
++QTEST_GUILESS_MAIN(TestHiResFrame)
++#include "tst_hiresframe.moc"
+-- 
+2.56.0
+
