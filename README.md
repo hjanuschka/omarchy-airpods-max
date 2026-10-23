@@ -146,6 +146,12 @@ To move to a newer upstream: bump the base, re-apply `patches/`, rebuild, run th
 suite. Each fork also carries its own `README.patches.md` with the same
 information and the exact `git rebase --onto` invocation.
 
+## Upstream
+
+Two pull requests carry this back to the plugin it forks, and
+[UPSTREAM.md](UPSTREAM.md) tracks them, what they depend on, and what to do when
+one lands. `tools/upstream-status.sh` prints their live state.
+
 ## Credits
 
 The AirPods work is other people's: `kavishdevar/librepods` for the AAP/AACP
