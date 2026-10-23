@@ -1,0 +1,261 @@
+From c5b9c904c0b7082e876b2377b07daef697a3d0ab Mon Sep 17 00:00:00 2001
+From: Helmut Januschka <helmut@januschka.com>
+Date: Fri, 23 Oct 2026 18:34:58 +0200
+Subject: [PATCH 7/9] hires mic: a switch and a state line in the popup
+
+Publishes three keys: supports_hires_mic so a daemon built without the
+decoder shows no row, hires_mic_enabled for the switch, and
+hires_mic_active while the stream runs. Absence reads as off, which is
+what an older daemon produces.
+
+The switch owns the source: off tears it down, so no app can pick a
+microphone that is not there, and the setting persists. Arming still
+follows the recorder, so the row's caption is a state line rather than
+a second control: it says the microphone is in use while a call holds
+it, and names the source to pick while it is idle.
+
+Measured through the same verbs the panel sends: off removed the
+source, on republished it, and the active key followed a recorder
+appearing and leaving.
+---
+ Model.js            |  7 +++++++
+ Panel.qml           | 21 ++++++++++++++++++++-
+ Service.qml         | 11 +++++++++++
+ daemon/main.cpp     | 32 ++++++++++++++++++++++++++++++--
+ tests/model.test.js | 13 +++++++++++++
+ 5 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/Model.js b/Model.js
+index f63cde2..16aa442 100644
+--- a/Model.js
++++ b/Model.js
+@@ -57,6 +57,9 @@ function defaultStatus() {
+     adaptiveNoiseLevel: 0,
+     oneBudANC: false,
+     conversationalAwareness: false,
++    supportsHiResMic: false,
++    hiResMicEnabled: false,
++    hiResMicActive: false,
+     earDetectionBehavior: EAR_PAUSE_ONE_OUT,
+     lidState: LID_UNKNOWN,
+     left: defaultPod(),
+@@ -149,6 +152,10 @@ function parseStatus(raw) {
+   status.adaptiveNoiseLevel = intOr(parsed.adaptive_noise_level, 0)
+   status.oneBudANC = parsed.one_bud_anc_mode === true
+   status.conversationalAwareness = parsed.conversational_awareness === true
++  // A daemon built without the microphone decoder sends none of these, which reads as absent.
++  status.supportsHiResMic = parsed.supports_hires_mic === true
++  status.hiResMicEnabled = parsed.hires_mic_enabled === true
++  status.hiResMicActive = parsed.hires_mic_active === true
+   status.earDetectionBehavior = intOr(parsed.ear_detection_behavior, EAR_PAUSE_ONE_OUT)
+   status.lidState = intOr(parsed.lid_state, LID_UNKNOWN)
+   status.left = podFrom(parsed.left)
+diff --git a/Panel.qml b/Panel.qml
+index c0b9996..ab91cb3 100644
+--- a/Panel.qml
++++ b/Panel.qml
+@@ -51,6 +51,7 @@ Panel {
+   readonly property bool modesVisible: pods.hasAirPods && modes.length > 0
+   readonly property bool caVisible: pods.hasAirPods && pods.supportsConversationalAwareness
+   readonly property bool oneBudVisible: pods.hasAirPods && pods.supportsOneBudANC
++  readonly property bool hiResMicVisible: pods.hasAirPods && pods.supportsHiResMic
+   readonly property string lidLabel: Model.lidText(pods.lidState)
+ 
+   // The daemon names the family, so the mark is the shape of the device actually connected.
+@@ -67,6 +68,7 @@ Panel {
+     if (adaptiveVisible) rows.push("adaptive")
+     if (caVisible) rows.push("ca")
+     if (oneBudVisible) rows.push("onebud")
++    if (hiResMicVisible) rows.push("mic")
+     rows.push("ear")
+     return rows
+   }
+@@ -93,6 +95,7 @@ Panel {
+     var name = cursorRow
+     if (name.indexOf("mode:") === 0) pods.setNoiseMode(parseInt(name.substring(5), 10))
+     else if (name === "ca") pods.setConversationalAwareness(!pods.conversationalAwareness)
++    else if (name === "mic") pods.setHiResMic(!pods.hiResMicEnabled)
+     else if (name === "onebud") pods.setOneBudANC(!pods.oneBudANC)
+     else if (name === "ear") pods.cycleEarDetection()
+   }
+@@ -183,6 +186,7 @@ Panel {
+         else if (key === "n") pods.setNoiseMode(Model.NOISE_ANC)
+         else if (key === "a") pods.setNoiseMode(Model.NOISE_ADAPTIVE)
+         else if (key === "c" && pods.supportsConversationalAwareness) pods.setConversationalAwareness(!pods.conversationalAwareness)
++        else if (key === "m" && root.hiResMicVisible) pods.setHiResMic(!pods.hiResMicEnabled)
+         else if (key === "b" && pods.supportsOneBudANC) pods.setOneBudANC(!pods.oneBudANC)
+         else if (key === "e") pods.cycleEarDetection()
+       }
+@@ -307,7 +311,7 @@ Panel {
+           }
+ 
+           PanelSeparator {
+-            visible: root.caVisible || root.oneBudVisible
++            visible: root.caVisible || root.oneBudVisible || root.hiResMicVisible
+             foreground: root.foreground
+           }
+ 
+@@ -326,6 +330,21 @@ Panel {
+               onToggled: pods.setConversationalAwareness(!pods.conversationalAwareness)
+             }
+ 
++            ToggleRow {
++              visible: root.hiResMicVisible
++              width: parent.width
++              rowName: "mic"
++              label: "AirPods microphone"
++              // The caption is the display: it says whether a call is on the pods right now.
++              caption: pods.hiResMicActive
++                       ? "In use now, 64 kHz, music keeps playing"
++                       : (pods.hiResMicEnabled
++                          ? "Pick \"AirPodsHiRes\" as your microphone"
++                          : "Off, so calls take another microphone")
++              checked: pods.hiResMicEnabled
++              onToggled: pods.setHiResMic(!pods.hiResMicEnabled)
++            }
++
+             ToggleRow {
+               visible: root.oneBudVisible
+               width: parent.width
+diff --git a/Service.qml b/Service.qml
+index c58828e..8e6ab8f 100644
+--- a/Service.qml
++++ b/Service.qml
+@@ -23,6 +23,9 @@ Item {
+   property int adaptiveNoiseLevel: 0
+   property bool oneBudANC: false
+   property bool conversationalAwareness: false
++  property bool supportsHiResMic: false
++  property bool hiResMicEnabled: false
++  property bool hiResMicActive: false
+   property int earDetectionBehavior: Model.EAR_PAUSE_ONE_OUT
+   property int lidState: Model.LID_UNKNOWN
+   property bool schemaUnsupported: false
+@@ -114,6 +117,10 @@ Item {
+     adaptiveNoiseLevel = _settle("adaptiveNoiseLevel", status.adaptiveNoiseLevel)
+     oneBudANC = _settle("oneBudANC", status.oneBudANC)
+     conversationalAwareness = _settle("conversationalAwareness", status.conversationalAwareness)
++    supportsHiResMic = status.supportsHiResMic
++    hiResMicEnabled = _settle("hiResMicEnabled", status.hiResMicEnabled)
++    // Reported by the daemon as the stream starts and stops, so it is never optimistic.
++    hiResMicActive = status.hiResMicActive
+     earDetectionBehavior = _settle("earDetectionBehavior", status.earDetectionBehavior)
+   }
+ 
+@@ -174,6 +181,10 @@ Item {
+     _send("adaptive:" + clamped, "adaptiveNoiseLevel", clamped)
+   }
+ 
++  function setHiResMic(enabled) {
++    _send(enabled ? "mic:on" : "mic:off", "hiResMicEnabled", enabled)
++  }
++
+   function setConversationalAwareness(enabled) {
+     _send(enabled ? "ca:on" : "ca:off", "conversationalAwareness", enabled)
+   }
+diff --git a/daemon/main.cpp b/daemon/main.cpp
+index 1010c8e..8ac9d7d 100644
+--- a/daemon/main.cpp
++++ b/daemon/main.cpp
+@@ -140,6 +140,7 @@ public:
+         // Load settings
+         CrossDevice.isEnabled = loadCrossDeviceEnabled();
+         setEarDetectionBehavior(loadEarDetectionSettings());
++        m_hiResMicEnabled = m_settings->value("hiresMic/enabled", true).toBool();
+         setRetryAttempts(loadRetryAttempts());
+         // Restore persisted PhoneMAC into the process env BEFORE
+         // connectToPhone() reads it. setPhoneMac persists to QSettings
+@@ -405,13 +406,34 @@ public slots:
+         m_hiResUnits = 0;
+         m_hiResTailBytes = 0;
+         socket->write(enabled ? start : stop);
++        emit airPodsStatusChanged();
+         LOG_INFO("Hi-res mic " << (enabled ? "armed" : "disarmed"));
+     }
+ 
++    // The panel switch. Off tears the source down, so no app can select a mic that is not there.
++    void setHiResMicUserEnabled(bool enabled)
++    {
++        if (m_hiResMicEnabled == enabled) {
++            return;
++        }
++        m_hiResMicEnabled = enabled;
++        m_settings->setValue("hiresMic/enabled", enabled);
++        if (enabled) {
++            startHiResMicSource();
++        } else {
++            stopHiResMicSource();
++        }
++        emit airPodsStatusChanged();
++        LOG_INFO("Hi-res mic " << (enabled ? "enabled" : "disabled") << " by request");
++    }
++
+     // The source is published for as long as the pods are connected, so an app can pick it
+     // before anything is streaming; the radio stream itself follows the recorder.
+     void startHiResMicSource()
+     {
++        if (!m_hiResMicEnabled) {
++            return;
++        }
+         if (m_hiResMic.isRunning() || !m_hiResMic.start()) {
+             return;
+         }
+@@ -1721,6 +1743,7 @@ signals:
+ 
+ private:
+     HiResMic m_hiResMic;
++    bool m_hiResMicEnabled = true;
+     QTimer *m_hiResMonitor = nullptr;
+     bool m_hiResMicArmed = false;
+     quint64 m_hiResSdus = 0;
+@@ -1867,6 +1890,11 @@ public:
+         // 0 = PauseWhenOneRemoved, 1 = PauseWhenBothRemoved,
+         // 2 = Disabled (matches MediaController::EarDetectionBehavior).
+         status.insert("ear_detection_behavior", earDetectionBehavior());
++        // The uplink is offered once its source is published, which needs the decoder this
++        // build was compiled against; enabled is the user's switch, active means it streams.
++        status.insert("supports_hires_mic", m_hiResMic.isRunning() || m_hiResMicEnabled);
++        status.insert("hires_mic_enabled", m_hiResMicEnabled);
++        status.insert("hires_mic_active", m_hiResMicArmed);
+         // 0 = open, 1 = closed, 2 = unknown (matches BleInfo::LidState).
+         status.insert("lid_state", lidState());
+         return status;
+@@ -2180,9 +2208,9 @@ int main(int argc, char *argv[]) {
+                     trayAppPtr->loadMainModule();
+                 }
+             } else if (msg == "mic:on") {
+-                trayAppPtr->setHiResMicEnabled(true);
++                trayAppPtr->setHiResMicUserEnabled(true);
+             } else if (msg == "mic:off") {
+-                trayAppPtr->setHiResMicEnabled(false);
++                trayAppPtr->setHiResMicUserEnabled(false);
+             } else if (msg == "noise:off") {
+                 trayAppPtr->setNoiseControlModeInt(0);
+             } else if (msg == "noise:anc") {
+diff --git a/tests/model.test.js b/tests/model.test.js
+index 3578bee..1cffc33 100644
+--- a/tests/model.test.js
++++ b/tests/model.test.js
+@@ -28,6 +28,19 @@ check("live case has no in_ear", good.caseBattery, { level: 100, charging: false
+ check("live supportsNoiseOff is honoured", good.supportsNoiseOff, false)
+ check("live noiseMode", good.noiseMode, 1)
+ 
++// The microphone keys, and their absence. A daemon built without the decoder sends none of them.
++check("live has no hi-res mic keys", good.supportsHiResMic, false)
++check("live hi-res mic enabled defaults off when absent", good.hiResMicEnabled, false)
++check("live hi-res mic active defaults off when absent", good.hiResMicActive, false)
++
++const withMic = Model.parseStatus('{"connected":true,"schema_version":1,"supports_hires_mic":true,"hires_mic_enabled":true,"hires_mic_active":false}')
++check("mic capability parses", withMic.supportsHiResMic, true)
++check("mic switch parses", withMic.hiResMicEnabled, true)
++check("mic idle parses", withMic.hiResMicActive, false)
++
++const micStreaming = Model.parseStatus('{"connected":true,"schema_version":1,"supports_hires_mic":true,"hires_mic_enabled":true,"hires_mic_active":true}')
++check("mic streaming parses", micStreaming.hiResMicActive, true)
++
+ // A fresh daemon omits left, right and case entirely rather than sending available:false.
+ const fresh = Model.parseStatus('{"connected":false,"noise_mode":-1,"schema_version":1}')
+ check("fresh line parses", fresh.ok, true)
+-- 
+2.56.0
+

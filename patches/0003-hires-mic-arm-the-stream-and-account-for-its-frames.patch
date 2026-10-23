@@ -1,7 +1,7 @@
 From 46ff28fccf5a9c8d93db5eb799028d5a0257583f Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 17:40:51 +0200
-Subject: [PATCH 4/6] hires mic: arm the stream and account for its frames
+Subject: [PATCH 4/9] hires mic: arm the stream and account for its frames
 
 Adds the mic:on and mic:off verbs, which write the 0x58 start and stop
 control packets to the control link, and routes audio SDUs away from the

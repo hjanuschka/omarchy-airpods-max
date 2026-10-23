@@ -8,7 +8,7 @@ WORKTREE=${WORKTREE:-$HOME/.cache/omarchy-airpods-max/omarchy-pods}
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PATCH_DIR=$HERE/patches
 BIN_DIR=$HOME/.local/bin
-PACKAGES=(qt6-base qt6-declarative qt6-tools cmake ninja ffmpeg libpulse python-evdev)
+PACKAGES=(qt6-base qt6-declarative qt6-tools cmake ninja ffmpeg libpulse pyside6)
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -90,6 +90,7 @@ build() {
     install -Dm755 "$WORKTREE/daemon/build/librepods-ctl" "$BIN_DIR/librepods-ctl"
     install -Dm644 "$WORKTREE/daemon/librepods.service" \
         "$HOME/.local/share/systemd/user/librepods.service"
+    install -Dm755 "$WORKTREE/tools/callcheck.py" "$BIN_DIR/airpods-callcheck"
     say "installed into $BIN_DIR"
 
     systemctl --user daemon-reload
