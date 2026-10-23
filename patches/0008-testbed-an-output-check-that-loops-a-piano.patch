@@ -1,7 +1,7 @@
 From 44bec261e48b64f032f878448d3f0f3ecb88c890 Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 18:43:13 +0200
-Subject: [PATCH 09/10] testbed: an output check that loops a piano
+Subject: [PATCH 09/11] testbed: an output check that loops a piano
 
 Adds a button that loops a four-note arpeggio with the notes
 alternating between left and right, so a dead channel is audible rather

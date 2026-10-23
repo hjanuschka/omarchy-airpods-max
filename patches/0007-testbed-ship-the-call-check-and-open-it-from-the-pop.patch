@@ -1,7 +1,7 @@
 From c26057ebfe00fee2d36d3847905fbf726490a921 Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 18:40:14 +0200
-Subject: [PATCH 08/10] testbed: ship the call check and open it from the popup
+Subject: [PATCH 08/11] testbed: ship the call check and open it from the popup
 
 Puts the pre-meeting check in the plugin rather than beside it: the
 script installs as airpods-callcheck and the popup gains a row that

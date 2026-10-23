@@ -1,7 +1,7 @@
 From b39be935501b5b7c02e10f61efb6186a4fb4437b Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 18:49:47 +0200
-Subject: [PATCH 10/10] hires mic: gate the gain, and prefer the suppressed
+Subject: [PATCH 10/11] hires mic: gate the gain, and prefer the suppressed
  source
 
 The gain rode to its ceiling whenever nobody spoke, which lifted the

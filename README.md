@@ -67,12 +67,25 @@ omarchy plugin add https://github.com/hjanuschka/omarchy-pods --enable
 
 ## The microphone and room noise
 
-The uplink carries the room with it. Measured over 250 ms windows on one
-machine with its fans audible: a voice reached -28.7 dBFS over a -41.0 dBFS
-room, about 12 dB. `config/99-airpods-rnnoise.conf` puts RNNoise over the same
-uplink and publishes `AirPodsClean`, which measured -57.5 dBFS of room against
--33.4 dBFS of voice, about 24 dB. Use `AirPodsClean` on calls; `AirPodsHiRes`
-is the raw uplink behind it.
+The uplink carries the room with it, and it arrives quiet: a voice measured
+near -51 dBFS. Two things follow, in this order.
+
+The daemon lifts it by a **fixed** +18 dB. A tracked gain was tried first and
+was the wrong instrument: it levelled a voice and the room to within 2 dB, and
+a noise suppressor keys on exactly that difference, so it stripped the voice
+along with the fans and recordings came back at -73 dBFS.
+
+`config/99-airpods-rnnoise.conf` then puts RNNoise over the lifted signal and
+publishes `AirPodsClean`. Measured over 250 ms windows, speech against room:
+
+| chain | speech | room | gap |
+|---|---|---|---|
+| raw uplink | -51.0 dBFS | -55.9 | 4.9 dB |
+| tracked gain, then RNNoise | -47.6 | -63.9 | 16.3 dB |
+| no gain, then RNNoise | -58.3 | -79.5 | 21.3 dB |
+| **fixed preamp, then RNNoise** | **-29.3** | **-52.3** | **23.0 dB** |
+
+Use `AirPodsClean` on calls; `AirPodsHiRes` is the lifted uplink behind it.
 
 The filter sits on the source corked, so it does not hold the radio stream open
 when nothing is recording.
