@@ -1,7 +1,7 @@
 From c5b9c904c0b7082e876b2377b07daef697a3d0ab Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 18:34:58 +0200
-Subject: [PATCH 7/9] hires mic: a switch and a state line in the popup
+Subject: [PATCH 07/10] hires mic: a switch and a state line in the popup
 
 Publishes three keys: supports_hires_mic so a daemon built without the
 decoder shows no row, hires_mic_enabled for the switch, and

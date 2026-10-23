@@ -1,7 +1,7 @@
 From b4f12af741821a4c7cef9b6f43c6d5931f7a21b7 Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 16:55:05 +0200
-Subject: [PATCH 3/9] hires mic: frame the 0x58 uplink
+Subject: [PATCH 03/10] hires mic: frame the 0x58 uplink
 
 The AirPods carry their high-resolution microphone as AACP message type
 0x58 subtype 0x0001 on the L2CAP PSM 0x1001 socket this daemon already

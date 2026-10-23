@@ -1,7 +1,7 @@
 From 8d9a25d8fbf90c8dcc2eaa878db47badc2489ed8 Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 17:49:31 +0200
-Subject: [PATCH 6/9] hires mic: gain the uplink and follow the recorder
+Subject: [PATCH 06/10] hires mic: gain the uplink and follow the recorder
 
 The raw uplink decodes quiet enough to sound faint on a call, so each
 frame now passes an envelope-tracked gain with a tanh limiter. Measured

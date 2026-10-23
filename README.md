@@ -21,6 +21,7 @@ RTL8761BU adapter, Omarchy, PipeWire 1.6.9, WirePlumber, Qt 6.12.
 | Microphone arms itself when an app records, disarms when it stops | works |
 | Switch and state line in the bar popup | works |
 | `testbed/callcheck.py`, a pre-meeting check | works |
+| Room noise suppressed on the microphone | works, `AirPodsClean` via RNNoise |
 
 ## The constraint that explains everything
 
@@ -63,6 +64,18 @@ It does not install the bar widget itself. That is the upstream plugin:
 ```bash
 omarchy plugin add https://github.com/hjanuschka/omarchy-pods --enable
 ```
+
+## The microphone and room noise
+
+The uplink carries the room with it. Measured over 250 ms windows on one
+machine with its fans audible: a voice reached -28.7 dBFS over a -41.0 dBFS
+room, about 12 dB. `config/99-airpods-rnnoise.conf` puts RNNoise over the same
+uplink and publishes `AirPodsClean`, which measured -57.5 dBFS of room against
+-33.4 dBFS of voice, about 24 dB. Use `AirPodsClean` on calls; `AirPodsHiRes`
+is the raw uplink behind it.
+
+The filter sits on the source corked, so it does not hold the radio stream open
+when nothing is recording.
 
 ## Before a meeting
 

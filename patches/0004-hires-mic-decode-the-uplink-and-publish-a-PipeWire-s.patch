@@ -1,7 +1,7 @@
 From f0f113de13698d926a3a561ec89855f35de976ea Mon Sep 17 00:00:00 2001
 From: Helmut Januschka <helmut@januschka.com>
 Date: Fri, 23 Oct 2026 17:43:39 +0200
-Subject: [PATCH 5/9] hires mic: decode the uplink and publish a PipeWire
+Subject: [PATCH 05/10] hires mic: decode the uplink and publish a PipeWire
  source
 
 Decodes each AAC-ELD access unit through the system libavcodec and
